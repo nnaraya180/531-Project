@@ -1,0 +1,208 @@
+// ═══════════════════════════════════════════════════════════
+// WEARABLE DEVICE: Sensor Data Collection & Publishing
+// Runs on: Raspberry Pi Zero W on chest strap
+// ═══════════════════════════════════════════════════════════
+
+GLOBAL VARIABLES:
+    session_active = false
+    current_prescription = null
+    sampling_rate = 100  // Hz (10ms intervals)
+    mqtt_client = null
+    sensor_buffer = []
+
+FUNCTION initialize_wearable():
+    // Hardware setup
+    ecg_sensor = setup_AD8232(pin_output=GPIO17)
+    stretch_sensor = setup_ADC(channel=0, reference_voltage=3.3)
+    imu_sensor = setup_MPU6050(i2c_address=0x68)
+    temp_sensor = setup_DS18B20(pin=GPIO4)
+    
+    // Communication setup
+    mqtt_client = connect_MQTT(
+        broker="192.168.1.100",
+        port=1883,
+        client_id="wearable_001"
+    )
+    
+    // Subscribe to command topics
+    mqtt_client.subscribe("commands/prescription")
+    mqtt_client.subscribe("commands/adjust")
+    mqtt_client.set_callback(on_command_received)
+    
+    RETURN success
+
+FUNCTION on_command_received(topic, message):
+    IF topic == "commands/prescription":
+        current_prescription = parse_json(message)
+        session_active = true
+        display_breathing_guide(current_prescription)
+        
+    ELSE IF topic == "commands/adjust":
+        adjustment = parse_json(message)
+        current_prescription = update_prescription(current_prescription, adjustment)
+        display_breathing_guide(current_prescription)
+        show_notification("Pattern adjusted: " + adjustment.reason)
+
+// ───────────────────────────────────────────────────────────
+// Main Sensor Loop (runs continuously during session)
+// ───────────────────────────────────────────────────────────
+
+FUNCTION sensor_monitoring_loop():
+    WHILE session_active:
+        timestamp = get_current_time()
+        
+        // Read all sensors
+        ecg_value = read_analog(ecg_sensor)
+        stretch_value = read_analog(stretch_sensor)
+        imu_data = read_imu(imu_sensor)  // {accel_x, accel_y, accel_z, gyro_x, gyro_y, gyro_z}
+        temperature = read_temperature(temp_sensor)
+        
+        // Store in buffer
+        sensor_sample = {
+            "timestamp": timestamp,
+            "ecg": ecg_value,
+            "stretch": stretch_value,
+            "accel_z": imu_data.accel_z,  // Chest rise/fall
+            "temperature": temperature
+        }
+        sensor_buffer.append(sensor_sample)
+        
+        // Process and publish every 30 seconds
+        IF (timestamp % 30000) == 0:  // Every 30 seconds (in milliseconds)
+            metrics = process_sensor_buffer(sensor_buffer)
+            publish_metrics(metrics, timestamp)
+            sensor_buffer = []  // Clear buffer
+        
+        sleep(10)  // 10ms delay (100 Hz sampling)
+
+// ───────────────────────────────────────────────────────────
+// Signal Processing & Feature Extraction
+// ───────────────────────────────────────────────────────────
+
+FUNCTION process_sensor_buffer(buffer):
+    // Extract ECG features
+    ecg_values = [sample.ecg FOR sample IN buffer]
+    r_peaks = detect_r_peaks(ecg_values, threshold=0.6)
+    rr_intervals = calculate_intervals(r_peaks)
+    
+    heart_rate = 60000 / mean(rr_intervals)  // bpm
+    hrv_rmssd = calculate_rmssd(rr_intervals)  // ms
+    
+    // Extract breathing features
+    stretch_values = [sample.stretch FOR sample IN buffer]
+    breath_peaks = detect_peaks(stretch_values, min_distance=20)
+    breathing_rate = (length(breath_peaks) / 30) * 60  // breaths per minute
+    
+    // Calculate breathing pattern adherence
+    breath_cycles = extract_breath_cycles(stretch_values, breath_peaks)
+    pattern_match = compare_to_prescription(breath_cycles, current_prescription)
+    
+    // Extract movement
+    accel_values = [sample.accel_z FOR sample IN buffer]
+    movement_magnitude = standard_deviation(accel_values)
+    
+    // Temperature
+    avg_temperature = mean([sample.temperature FOR sample IN buffer])
+    
+    // Return processed metrics
+    RETURN {
+        "timestamp": buffer[-1].timestamp,
+        "heart_rate": heart_rate,
+        "hrv": hrv_rmssd,
+        "breathing_rate": breathing_rate,
+        "pattern_adherence": pattern_match,  // 0-100%
+        "movement": classify_movement(movement_magnitude),
+        "temperature": avg_temperature
+    }
+
+// ───────────────────────────────────────────────────────────
+// Helper: Detect R-peaks in ECG signal
+// ───────────────────────────────────────────────────────────
+
+FUNCTION detect_r_peaks(ecg_signal, threshold):
+    // Simple peak detection algorithm
+    filtered_signal = apply_bandpass_filter(ecg_signal, low=0.5, high=40)
+    
+    peaks = []
+    FOR i FROM 1 TO length(filtered_signal) - 1:
+        IF filtered_signal[i] > threshold AND
+           filtered_signal[i] > filtered_signal[i-1] AND
+           filtered_signal[i] > filtered_signal[i+1]:
+            peaks.append(i)
+    
+    RETURN peaks
+
+FUNCTION calculate_rmssd(rr_intervals):
+    // Root Mean Square of Successive Differences (HRV metric)
+    differences = []
+    FOR i FROM 0 TO length(rr_intervals) - 2:
+        diff = rr_intervals[i+1] - rr_intervals[i]
+        differences.append(diff * diff)
+    
+    rmssd = square_root(mean(differences))
+    RETURN rmssd
+
+// ───────────────────────────────────────────────────────────
+// Breathing Pattern Analysis
+// ───────────────────────────────────────────────────────────
+
+FUNCTION extract_breath_cycles(stretch_values, peaks):
+    cycles = []
+    
+    FOR i FROM 0 TO length(peaks) - 1:
+        start_idx = peaks[i]
+        end_idx = peaks[i+1] IF i+1 < length(peaks) ELSE length(stretch_values)
+        
+        // Find midpoint (transition from inhale to exhale)
+        cycle_values = stretch_values[start_idx:end_idx]
+        max_idx = index_of_max(cycle_values)
+        
+        // Calculate durations (in samples, convert to seconds)
+        inhale_duration = max_idx / sampling_rate
+        exhale_duration = (end_idx - start_idx - max_idx) / sampling_rate
+        
+        cycles.append({
+            "inhale": inhale_duration,
+            "exhale": exhale_duration,
+            "total": (end_idx - start_idx) / sampling_rate
+        })
+    
+    RETURN cycles
+
+FUNCTION compare_to_prescription(breath_cycles, prescription):
+    IF prescription == null:
+        RETURN 0
+    
+    target_inhale = prescription.inhale_seconds
+    target_exhale = prescription.exhale_seconds
+    tolerance = 1.0  // seconds
+    
+    matches = 0
+    FOR cycle IN breath_cycles:
+        inhale_match = abs(cycle.inhale - target_inhale) < tolerance
+        exhale_match = abs(cycle.exhale - target_exhale) < tolerance
+        
+        IF inhale_match AND exhale_match:
+            matches += 1
+    
+    adherence_percentage = (matches / length(breath_cycles)) * 100
+    RETURN adherence_percentage
+
+// ───────────────────────────────────────────────────────────
+// Publish to MQTT
+// ───────────────────────────────────────────────────────────
+
+FUNCTION publish_metrics(metrics, timestamp):
+    payload = create_json({
+        "device_id": "wearable_001",
+        "timestamp": timestamp,
+        "metrics": metrics
+    })
+    
+    mqtt_client.publish(
+        topic="session/metrics",
+        payload=payload,
+        qos=1  // At least once delivery
+    )
+    
+    log("Published metrics at " + timestamp)

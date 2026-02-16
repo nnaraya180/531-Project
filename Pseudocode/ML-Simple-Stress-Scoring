@@ -1,0 +1,82 @@
+// ═══════════════════════════════════════════════════════════
+// STRESS SCORING ALGORITHM (runs on wearable before sending baseline)
+// ═══════════════════════════════════════════════════════════
+
+FUNCTION calculate_stress_score(metrics, user_baseline):
+    score = 0.0
+    indicators = []
+    
+    // ─── HRV Analysis (40% weight) ───
+    hrv_ratio = metrics.hrv / user_baseline.hrv
+    
+    IF hrv_ratio < 0.7:  // Severe HRV reduction
+        score += 4.0
+        indicators.append("Severe HRV reduction (sympathetic dominance)")
+    ELSE IF hrv_ratio < 0.85:  // Moderate reduction
+        score += 2.5
+        indicators.append("Low HRV (moderate stress)")
+    ELSE IF hrv_ratio < 1.0:
+        score += 1.0
+        indicators.append("Slightly reduced HRV")
+    
+    // ─── Heart Rate Analysis (30% weight) ───
+    hr_increase_percent = ((metrics.heart_rate - user_baseline.heart_rate) / user_baseline.heart_rate) * 100
+    
+    IF hr_increase_percent > 20:
+        score += 3.0
+        indicators.append("Significantly elevated heart rate (+" + hr_increase_percent + "%)")
+    ELSE IF hr_increase_percent > 10:
+        score += 2.0
+        indicators.append("Elevated heart rate")
+    ELSE IF hr_increase_percent > 5:
+        score += 1.0
+    
+    // ─── Breathing Analysis (20% weight) ───
+    IF metrics.breathing_rate > 16:  // Rapid breathing
+        breathing_score = (metrics.breathing_rate - 14) * 0.15
+        score += min(breathing_score, 2.0)
+        indicators.append("Rapid shallow breathing (" + metrics.breathing_rate + " bpm)")
+    ELSE IF metrics.breathing_rate > 14:
+        score += 0.5
+    
+    // ─── Temperature (10% weight) ───
+    temp_deviation = metrics.temperature - user_baseline.temperature
+    IF temp_deviation > 0.5:
+        score += 1.0
+        indicators.append("Elevated skin temperature")
+    
+    // ─── Normalize to 0-10 scale ───
+    final_score = min(score, 10.0)
+    
+    // ─── Categorize ───
+    IF final_score >= 7.0:
+        category = "High Stress"
+        recommendation = ["Immediate calming intervention", "Focus on extended exhales"]
+    ELSE IF final_score >= 4.0:
+        category = "Moderate Stress"
+        recommendation = ["Balanced breathing practice", "Build resilience"]
+    ELSE:
+        category = "Low Stress"
+        recommendation = ["Maintenance practice", "Deepen awareness"]
+    
+    RETURN {
+        "score": round(final_score, 1),
+        "category": category,
+        "confidence": calculate_confidence(metrics),
+        "indicators": indicators,
+        "recommendations": recommendation
+    }
+
+FUNCTION calculate_confidence(metrics):
+    // Confidence based on data quality
+    confidence = 1.0
+    
+    // Reduce confidence if movement detected
+    IF metrics.movement != "minimal":
+        confidence -= 0.15
+    
+    // Reduce if signal quality poor (example check)
+    IF metrics.signal_quality < 0.8:
+        confidence -= 0.20
+    
+    RETURN max(confidence, 0.5)  // Minimum 50% confidence

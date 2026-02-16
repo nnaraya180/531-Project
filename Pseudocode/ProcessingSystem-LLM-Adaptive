@@ -1,0 +1,252 @@
+// ═══════════════════════════════════════════════════════════
+// PROCESSING SYSTEM: Real-time Analysis & Adjustment
+// Runs on: Raspberry Pi 4 or Laptop
+// ═══════════════════════════════════════════════════════════
+
+GLOBAL VARIABLES:
+    session_data = []
+    baseline_metrics = null
+    current_prescription = null
+    adjustment_count = 0
+    max_adjustments = 5
+    llm_client = null
+
+FUNCTION initialize_processing_system():
+    // Setup MQTT
+    mqtt_client = connect_MQTT(
+        broker="192.168.1.100",
+        port=1883,
+        client_id="processor_001"
+    )
+    
+    mqtt_client.subscribe("session/baseline")
+    mqtt_client.subscribe("session/metrics")
+    mqtt_client.subscribe("session/complete")
+    mqtt_client.set_callback(on_message_received)
+    
+    // Setup LLM
+    llm_client = initialize_anthropic_client(api_key=ENV["ANTHROPIC_KEY"])
+    
+    RETURN success
+
+// ───────────────────────────────────────────────────────────
+// Message Handler
+// ───────────────────────────────────────────────────────────
+
+FUNCTION on_message_received(topic, message):
+    data = parse_json(message)
+    
+    IF topic == "session/baseline":
+        handle_session_start(data)
+        
+    ELSE IF topic == "session/metrics":
+        handle_metrics_update(data)
+        
+    ELSE IF topic == "session/complete":
+        handle_session_end(data)
+
+// ───────────────────────────────────────────────────────────
+// Handle Real-time Metrics (Every 30 seconds)
+// ───────────────────────────────────────────────────────────
+
+FUNCTION handle_metrics_update(data):
+    metrics = data.metrics
+    timestamp = data.timestamp
+    
+    // Store in session history
+    session_data.append({
+        "timestamp": timestamp,
+        "metrics": metrics
+    })
+    
+    // Calculate progress since baseline
+    progress = calculate_progress(metrics, baseline_metrics)
+    
+    // Log to dashboard
+    send_to_dashboard({
+        "type": "metrics_update",
+        "metrics": metrics,
+        "progress": progress
+    })
+    
+    // Decide if adjustment is needed
+    IF should_adjust(metrics, progress):
+        adjustment = generate_adjustment(metrics, progress)
+        apply_adjustment(adjustment)
+
+// ───────────────────────────────────────────────────────────
+// Progress Calculation
+// ───────────────────────────────────────────────────────────
+
+FUNCTION calculate_progress(current, baseline):
+    // Calculate percentage changes
+    hr_change = ((baseline.heart_rate - current.heart_rate) / baseline.heart_rate) * 100
+    hrv_change = ((current.hrv - baseline.hrv) / baseline.hrv) * 100
+    br_change = ((baseline.breathing_rate - current.breathing_rate) / baseline.breathing_rate) * 100
+    
+    // Positive changes indicate stress reduction
+    RETURN {
+        "heart_rate_reduction": hr_change,  // % decrease
+        "hrv_improvement": hrv_change,      // % increase
+        "breathing_slowdown": br_change,    // % decrease
+        "overall_trend": (hr_change + hrv_change + br_change) / 3
+    }
+
+// ───────────────────────────────────────────────────────────
+// Adjustment Decision Logic
+// ───────────────────────────────────────────────────────────
+
+FUNCTION should_adjust(metrics, progress):
+    // Don't adjust if we've hit the limit
+    IF adjustment_count >= max_adjustments:
+        RETURN false
+    
+    // Don't adjust too early
+    IF length(session_data) < 2:  // Need at least 1 minute of data
+        RETURN false
+    
+    // Adjust if not making good progress
+    IF progress.overall_trend < 5:  // Less than 5% improvement
+        RETURN true
+    
+    // Adjust if user isn't following pattern well
+    IF metrics.pattern_adherence < 70:
+        RETURN true
+    
+    // Adjust if stress is increasing
+    IF progress.hrv_improvement < -5:  // HRV getting worse
+        RETURN true
+    
+    // Adjust if making great progress (can optimize further)
+    IF progress.overall_trend > 20 AND metrics.pattern_adherence > 85:
+        RETURN true
+    
+    RETURN false
+
+// ───────────────────────────────────────────────────────────
+// ML/LLM Adjustment Generation
+// ───────────────────────────────────────────────────────────
+
+FUNCTION generate_adjustment(metrics, progress):
+    // Prepare context for LLM
+    context = create_json({
+        "current_prescription": current_prescription,
+        "current_metrics": metrics,
+        "baseline_metrics": baseline_metrics,
+        "progress": progress,
+        "session_duration": length(session_data) * 30,  // seconds
+        "previous_adjustments": adjustment_count
+    })
+    
+    // LLM Prompt
+    prompt = """
+    You are optimizing a breathing meditation pattern in real-time.
+    
+    Current prescription: {current_prescription.inhale}s inhale, 
+                         {current_prescription.hold}s hold, 
+                         {current_prescription.exhale}s exhale
+    
+    Biometric data:
+    - Heart rate: {metrics.heart_rate} bpm (baseline: {baseline_metrics.heart_rate})
+    - HRV: {metrics.hrv} ms (baseline: {baseline_metrics.hrv})
+    - Breathing rate: {metrics.breathing_rate} bpm
+    - Pattern adherence: {metrics.pattern_adherence}%
+    
+    Progress:
+    - HR reduction: {progress.heart_rate_reduction}%
+    - HRV improvement: {progress.hrv_improvement}%
+    - Overall trend: {progress.overall_trend}%
+    
+    Based on this data, should we adjust the breathing pattern? If yes:
+    1. Provide new inhale/hold/exhale durations (in seconds)
+    2. Explain the reasoning in one sentence
+    3. Format: JSON with keys: adjust (bool), new_pattern, reason
+    
+    Guidelines:
+    - If adherence is low, simplify the pattern
+    - If progress is good, deepen relaxation (longer exhale)
+    - If HRV improving, can extend hold time
+    - Keep changes gradual (±1-2 seconds)
+    """
+    
+    // Call LLM
+    response = llm_client.generate(
+        model="claude-sonnet-4-20250514",
+        prompt=fill_template(prompt, context),
+        max_tokens=200
+    )
+    
+    adjustment = parse_json(response.content)
+    
+    // Validate adjustment
+    IF adjustment.adjust == true:
+        // Safety checks
+        IF adjustment.new_pattern.inhale < 2 OR adjustment.new_pattern.inhale > 10:
+            adjustment.new_pattern.inhale = clamp(adjustment.new_pattern.inhale, 2, 10)
+        
+        IF adjustment.new_pattern.exhale < 2 OR adjustment.new_pattern.exhale > 15:
+            adjustment.new_pattern.exhale = clamp(adjustment.new_pattern.exhale, 2, 15)
+        
+        IF adjustment.new_pattern.hold > 10:
+            adjustment.new_pattern.hold = 10
+        
+        RETURN adjustment
+    ELSE:
+        RETURN null
+
+// ───────────────────────────────────────────────────────────
+// Apply and Publish Adjustment
+// ───────────────────────────────────────────────────────────
+
+FUNCTION apply_adjustment(adjustment):
+    IF adjustment == null:
+        RETURN
+    
+    // Update current prescription
+    current_prescription = {
+        "inhale_seconds": adjustment.new_pattern.inhale,
+        "hold_seconds": adjustment.new_pattern.hold,
+        "exhale_seconds": adjustment.new_pattern.exhale,
+        "reason": adjustment.reason
+    }
+    
+    adjustment_count += 1
+    
+    // Publish to wearable
+    payload = create_json(current_prescription)
+    mqtt_client.publish(
+        topic="commands/adjust",
+        payload=payload,
+        qos=1
+    )
+    
+    // Notify dashboard
+    send_to_dashboard({
+        "type": "adjustment",
+        "prescription": current_prescription,
+        "count": adjustment_count
+    })
+    
+    log("Adjustment #{adjustment_count}: {adjustment.reason}")
+
+// ───────────────────────────────────────────────────────────
+// Dashboard Communication
+// ───────────────────────────────────────────────────────────
+
+FUNCTION send_to_dashboard(data):
+    // Send via WebSocket for real-time updates
+    websocket_broadcast(
+        channel="session_updates",
+        data=create_json(data)
+    )
+
+// ───────────────────────────────────────────────────────────
+// Main Loop
+// ───────────────────────────────────────────────────────────
+
+FUNCTION main():
+    initialize_processing_system()
+    
+    WHILE true:
+        mqtt_client.loop()  // Process incoming messages
+        sleep(100)  // 100ms
